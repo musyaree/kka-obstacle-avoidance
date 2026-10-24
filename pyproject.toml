@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "obstacle-avoidance-sim"
+version = "0.1.0"
+description = "Simulasi DAVG + A* dan LMPC (cf-MPC) untuk obstacle avoidance humanoid, mata kuliah KKA"
+requires-python = ">=3.10"
+dependencies = [
+    "pygame>=2.5",
+    "numpy>=1.26",
+]
+
+[project.optional-dependencies]
+# cvxpy baru dibutuhkan saat modul control/cfmpc.py dikerjakan (v2.0).
+mpc = ["cvxpy>=1.4"]
+dev = ["pytest>=7"]
+
+[tool.setuptools.packages.find]
+include = ["sim*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

@@ -1,0 +1,25 @@
+{
+  "nama": "Dasar: tiga obstacle dan satu lawan yang muncul",
+  "start": {"x": 2.0, "y": 4.5, "theta": 0.0},
+  "goal": {"x": 12.0, "y": 4.5},
+  "obstacles": [
+    {"x": 7.0, "y": 4.5, "radius": 0.6},
+    {"x": 5.0, "y": 6.8, "radius": 0.5},
+    {"x": 9.0, "y": 2.5, "radius": 0.5, "vx": 0.0, "vy": 0.6}
+  ],
+  "events": [
+    {"t": 5.0, "aksi": "munculkan_obstacle", "obstacle": {"x": 10.0, "y": 4.5, "radius": 0.5}}
+  ],
+  "layers": {
+    "obstacle": true,
+    "safe_zone": true,
+    "sg_line": true,
+    "active_region": false,
+    "visibility_graph": false,
+    "path": true,
+    "trajectory": false,
+    "horizon": false,
+    "tangent_planes": false,
+    "hud": true
+  }
+}

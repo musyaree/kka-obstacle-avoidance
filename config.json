@@ -1,0 +1,22 @@
+{
+  "field_width": 14.0,
+  "field_height": 9.0,
+
+  "robot_radius": 0.35,
+  "max_speed": 2.0,
+  "max_accel": 2.0,
+  "max_omega": 2.0,
+  "max_alpha": 6.0,
+  "manual_speed_ratio": 0.5,
+
+  "obstacle_max_speed": 2.0,
+  "polygon_sides": 18,
+  "safety_margin": 0.2,
+
+  "lambda_turn": 1.0,
+  "rho_slack": 100.0,
+  "horizon": 10,
+  "dt_mpc": 0.25,
+  "goal_threshold": 0.3,
+  "noise_std": 0.0
+}
