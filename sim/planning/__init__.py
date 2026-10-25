@@ -1,30 +1,32 @@
-import time
-from sim.types import Scene, PlanResult, PlanStatus
-from sim.geometry import Vec2
-from sim.planning.graph import VisibilityGraph
-from sim.planning.search import AugmentedAStar, interpolate_trajectory
+"""Modul perencanaan rute DAVG + A* (PRD §4.2, §4.3)."""
+from sim.planning.graph import ActiveRegion, ActiveRegionSelector, VisibilityGraph
+from sim.planning.search import (
+    AugmentedAStar,
+    AugmentedSearch,
+    Planner,
+    TrajectoryInterpolator,
+    get_turn_angle,
+    interpolate_trajectory,
+)
+from sim.types import PlanResult, Scene
 
-def plan(scene: Scene, cfg) -> PlanResult:
-    """Fungsi utama yang dipanggil Engine pada setiap frame jika terjadi replanning."""
-    t0 = time.perf_counter()
-    vg = VisibilityGraph(scene)
-    edges, active_obs = vg.build()
-    
-    """ Pencarian Jalur """
-    start = scene.robot.pose.position if hasattr(scene.robot, 'pose') else Vec2(0, 0)
-    astar = AugmentedAStar(start, scene.goal, edges, getattr(cfg, 'lambda_turn', 1.0))
-    path = astar.search()
-    
-    status = PlanStatus.OK if path else PlanStatus.NO_PATH
-    trajectory = interpolate_trajectory(path, getattr(cfg, 'v_max', 2.0), getattr(cfg, 'dt', 0.25)) if path else []
-    
-    dt_ms = (time.perf_counter() - t0) * 1000.0
-    
-    return PlanResult(
-        status=status,
-        path=path or [],
-        trajectory=trajectory,
-        region=vg.region_bbox, 
-        edges=edges,           
-        solve_time_ms=dt_ms
-    )
+_default_planner = Planner()
+
+
+def plan(scene: Scene, cfg=None) -> PlanResult:
+    """Fungsi utama antarmuka planning: plan(scene, cfg) -> PlanResult (PRD §4.3)."""
+    return _default_planner.plan(scene, cfg)
+
+
+__all__ = [
+    "plan",
+    "Planner",
+    "VisibilityGraph",
+    "ActiveRegion",
+    "ActiveRegionSelector",
+    "AugmentedSearch",
+    "AugmentedAStar",
+    "TrajectoryInterpolator",
+    "interpolate_trajectory",
+    "get_turn_angle",
+]

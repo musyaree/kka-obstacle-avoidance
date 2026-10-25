@@ -37,6 +37,9 @@ class Vec2:
     def dist(self, other: Vec2) -> float:
         return (self - other).norm()
 
+    def __lt__(self, other: Vec2) -> bool:
+        return (self.x, self.y) < (other.x, other.y)
+
 
 @dataclass(frozen=True)
 class Pose:
@@ -55,6 +58,25 @@ class Velocity:
     vx: float = 0.0
     vy: float = 0.0
     omega: float = 0.0
+
+
+@dataclass(frozen=True)
+class TrajectoryPoint:
+    """Satu titik pada trajektori berinterpolasi waktu.
+
+    Dihasilkan oleh planning.TrajectoryInterpolator dan dikonsumsi oleh
+    FollowerController maupun CfMpcController.
+
+    Atribut:
+        pos   -- posisi dunia (meter).
+        theta -- sudut hadap (radian, CCW dari sumbu-x).
+        speed -- kelajuan yang disarankan di titik ini (m/s).
+        t     -- waktu relatif dari awal trajektori (detik).
+    """
+    pos: Vec2
+    theta: float = 0.0
+    speed: float = 1.0
+    t: float = 0.0
 
 
 class Mode(Enum):
@@ -160,12 +182,24 @@ class Intent:
 # ----------------------------------------------------------------- keluaran ---
 
 @dataclass
+class ActiveRegion:
+    """Wilayah aktif DAVG (bounding box dan ID obstacle yang memotong/diperluas)."""
+    bbox: Optional[tuple[float, float, float, float]] = None
+    obstacle_ids: list[int] = field(default_factory=list)
+
+    def __iter__(self):
+        if self.bbox is not None:
+            return iter(self.bbox)
+        return iter(())
+
+
+@dataclass
 class PlanResult:
     """Diisi modul planning (v1.1). Rangka ini sudah memuat data debug lapisan 4-7."""
     status: PlanStatus = PlanStatus.OK
     path: list[Vec2] = field(default_factory=list)
-    trajectory: list = field(default_factory=list)
-    region: object = None
+    trajectory: list[TrajectoryPoint] = field(default_factory=list)
+    region: Optional[ActiveRegion] = None
     edges: list = field(default_factory=list)
     solve_time_ms: float = 0.0
 
