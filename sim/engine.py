@@ -1,8 +1,7 @@
 """Engine: satu-satunya tempat mesin status, dinamika, gerak obstacle, dan kejadian.
 
 Murni, tanpa pygame. Seluruh masukan lewat Intent pada tick(); seluruh keluaran
-berupa Frame. Pada MVP hanya mode MANUAL yang berjalan; AUTO menunggu planning
-(v1.1) dan control (v2.0).
+berupa Frame. Mode MANUAL dan AUTO (v1.1) berjalan dengan DAVG dan Controller.
 """
 from __future__ import annotations
 
@@ -11,8 +10,15 @@ import math
 from typing import Optional
 
 from .config import Config, Scenario, TimedEvent, build_obstacle
+from .control import Controller, FollowerController
 from .dynamics import Robot, RobotLimits
-from .types import Frame, Intent, Mode, Pose, Scene, Vec2, Velocity
+from .planning import Planner
+from .types import Frame, Intent, Mode, PlanResult, PlanStatus, Pose, Scene, TrackResult, Vec2, Velocity
+
+try:
+    from .control import CfMpcController
+except ImportError:
+    CfMpcController = None
 
 
 class EventScheduler:
@@ -37,6 +43,12 @@ class Engine:
     def __init__(self, cfg: Config, scenario: Scenario):
         self.cfg = cfg
         self._scheduler = EventScheduler([])
+        self.planner = Planner(self.cfg)
+        self.follower = FollowerController(self.cfg)
+        self.cfmpc = CfMpcController(self.cfg) if CfMpcController is not None else None
+        self.controller: Controller = self.follower
+        self.last_plan: Optional[PlanResult] = None
+        self.last_track: Optional[TrackResult] = None
         self.reset(scenario)
 
     # ----------------------------------------------------------------- reset ---
@@ -54,18 +66,71 @@ class Engine:
         self.paused = False
         self.selected_id: Optional[int] = None
         self.time = 0.0
+        self.last_plan = None
+        self.last_track = None
+        self._replan_period = 0.1  # detik (10 Hz replan saat obstacle bergerak)
+        self._time_since_plan = float("inf")
 
     # ------------------------------------------------------------------ tick ---
 
     def tick(self, dt: float, intent: Optional[Intent] = None) -> Frame:
         intent = intent or Intent()
         notice = self._apply_intent(intent)
+
         if not self.paused:
             self.time += dt
-            notice = self._run_events() or notice
+            self._time_since_plan += dt
+            evt_notice = self._run_events()
+            if evt_notice:
+                notice = evt_notice
+
             for obstacle in self.scene.obstacles:
                 obstacle.step(dt, self.scene.width, self.scene.height)
-            self._step_robot(intent.manual, dt)
+
+            # Cek apakah robot sampai di goal saat AUTO (jarak <= threshold)
+            if self.mode is Mode.AUTO:
+                if self.scene.robot.pose.position.dist(self.scene.goal) <= self.cfg.goal_threshold:
+                    self.mode = Mode.MANUAL
+                    notice = "Sampai di goal"
+
+            if self.mode is Mode.MANUAL:
+                self._step_robot(intent.manual, dt)
+                self.last_plan = None
+                self.last_track = None
+            else:
+                # Mode AUTO: DAVG merencanakan jalur jika sudah waktunya / ada perubahan
+                needs_replan = (
+                    self.last_plan is None
+                    or bool(intent.moves)
+                    or bool(evt_notice)
+                    or self.last_plan.status == PlanStatus.NO_PATH
+                    or self._time_since_plan >= self._replan_period
+                )
+                if needs_replan:
+                    self.last_plan = self.planner.plan(self.scene, self.cfg)
+                    self._time_since_plan = 0.0
+
+                if self.last_plan.status == PlanStatus.NO_PATH:
+                    notice = "Tidak ada jalur"
+                    self.last_track = self.controller.track(self.scene.robot, [], self.scene.obstacles)
+                    self.scene.robot.step(Velocity(0.0, 0.0, 0.0), dt, self.scene.width, self.scene.height)
+                else:
+                    self.last_track = self.controller.track(
+                        self.scene.robot, self.last_plan.trajectory, self.scene.obstacles
+                    )
+                    self.scene.robot.step(self.last_track.command, dt, self.scene.width, self.scene.height)
+
+                    if self.scene.robot.pose.position.dist(self.scene.goal) <= self.cfg.goal_threshold:
+                        self.mode = Mode.MANUAL
+                        notice = "Sampai di goal"
+        else:
+            # Saat paused, jika mode AUTO dan ada perpindahan objek, perbarui plan
+            if self.mode is Mode.AUTO and intent.moves:
+                self.last_plan = self.planner.plan(self.scene, self.cfg)
+                self.last_track = self.controller.track(
+                    self.scene.robot, self.last_plan.trajectory, self.scene.obstacles
+                )
+
         return self._frame(notice)
 
     # --------------------------------------------------------------- internal ---
@@ -74,19 +139,45 @@ class Engine:
         notice = ""
         if intent.toggle_pause:
             self.paused = not self.paused
-        if intent.toggle_auto:
-            notice = "Mode AUTO belum tersedia pada MVP (menunggu DAVG dan cf-MPC)"
+
         if intent.switch_controller:
-            notice = "Pengendali belum tersedia pada MVP"
+            if self.cfmpc is not None:
+                self.controller = self.cfmpc if self.controller is self.follower else self.follower
+                notice = f"Pengendali: {self.controller.name}"
+            else:
+                notice = "cf-MPC belum tersedia (v2.0); memakai pengikut sederhana"
+
+        # Menekan WASD/QE saat AUTO: keluar dari mode AUTO kembali ke MANUAL
+        is_manual_active = (
+            abs(intent.manual.vx) > 1e-3
+            or abs(intent.manual.vy) > 1e-3
+            or abs(intent.manual.omega) > 1e-3
+        )
+        if self.mode is Mode.AUTO and is_manual_active:
+            self.mode = Mode.MANUAL
+            notice = "Kembali ke mode MANUAL"
+
+        # Menekan Enter untuk toggle AUTO
+        if intent.toggle_auto:
+            if self.mode is Mode.MANUAL:
+                self.mode = Mode.AUTO
+                notice = "Masuk mode AUTO"
+            else:
+                self.mode = Mode.MANUAL
+                notice = "Kembali ke mode MANUAL"
+
         for move in intent.moves:
             self._apply_move(move.kind, move.pos, move.id)
+
         for sv in intent.set_velocities:
             obstacle = self.scene.obstacle(sv.id)
             if obstacle is not None:
                 obstacle.set_velocity(sv.velocity, self.cfg.obstacle_max_speed)
+
         if intent.select is not None:
             wanted = intent.select.id
             self.selected_id = wanted if wanted is None or self.scene.obstacle(wanted) else None
+
         return notice
 
     def _apply_move(self, kind: str, pos: Vec2, obstacle_id: int) -> None:
@@ -135,13 +226,17 @@ class Engine:
         self.scene.robot.step(cmd, dt, self.scene.width, self.scene.height)
 
     def _frame(self, notice: str) -> Frame:
+        controller_name = self.controller.name if self.mode is Mode.AUTO else "-"
         return Frame(
             scene=copy.deepcopy(self.scene),
             mode=self.mode,
             paused=self.paused,
             selected_id=self.selected_id,
             sim_time=self.time,
+            controller_name=controller_name,
             notice=notice,
+            plan=self.last_plan,
+            track=self.last_track,
         )
 
 

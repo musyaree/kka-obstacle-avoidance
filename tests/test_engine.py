@@ -119,10 +119,12 @@ def test_kejadian_menghapus_obstacle_dan_membatalkan_pilihan():
     assert frame.selected_id is None
 
 
-def test_enter_belum_mengaktifkan_auto_pada_mvp():
+def test_enter_mengaktifkan_mode_auto():
     frame = make_engine().tick(DT, Intent(toggle_auto=True))
-    assert frame.mode is Mode.MANUAL
-    assert "AUTO" in frame.notice
+    assert frame.mode is Mode.AUTO
+    assert frame.plan is not None
+    assert frame.track is not None
+    assert frame.controller_name != "-"
 
 
 def test_reset_mengembalikan_keadaan_awal():
