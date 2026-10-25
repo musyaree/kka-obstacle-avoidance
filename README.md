@@ -7,8 +7,9 @@ Simulasi pygame untuk demo mata kuliah KKA (kelompok 8), perencanaan jalur denga
 Butuh Python 3.10 atau lebih baru.
 
 ```
-pip install pygame numpy
-python -m sim.app
+python3 -m venv --system-site-packages .venv
+.venv/bin/pip install pygame numpy cvxpy pytest
+.venv/bin/python -m sim.app
 ```
 
 ## Kontrol
@@ -32,18 +33,18 @@ Kecepatan obstacle juga bisa diisi sebagai angka lewat panel.
 
 ## Lapisan visualisasi
 
-| Tombol | Lapisan | Status |
+| Tombol | Lapisan | Keterangan |
 |---|---|---|
-| 1 | Obstacle | ada |
-| 2 | Zona aman | ada |
-| 3 | Garis S-G | ada |
-| 4 | Active region | menunggu DAVG |
-| 5 | Visibility graph | menunggu DAVG |
-| 6 | Jalur DAVG | menunggu DAVG |
-| 7 | Trajektori | menunggu AUTO |
-| 8 | Horizon MPC | menunggu LMPC |
-| 9 | Bidang singgung | menunggu LMPC |
-| 0 | HUD | ada |
+| 1 | Obstacle | poligon obstacle berlabel id; yang terpilih bertepi kuning |
+| 2 | Zona aman | lingkaran radius obstacle + radius robot + margin aman |
+| 3 | Garis S-G | garis lurus dari robot ke goal |
+| 4 | Active region | kotak wilayah aktif DAVG dan obstacle yang ikut dihitung |
+| 5 | Visibility graph | seluruh edge pada graf visibilitas |
+| 6 | Jalur DAVG | jalur terpendek hasil A* beserta vertex-nya |
+| 7 | Trajektori | jalur yang diinterpolasi, satu titik tiap `dt_mpc` |
+| 8 | Horizon MPC | posisi prediksi N langkah dari robot (saat AUTO) |
+| 9 | Bidang singgung | batas tabrakan pada zona aman obstacle dekat (hanya cf-MPC) |
+| 0 | HUD | mode, pengendali, FPS, waktu solve DAVG dan MPC, slack |
 
 ## Konfigurasi
 

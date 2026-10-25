@@ -79,8 +79,30 @@ def segment_hits_polygon(a: Vec2, b: Vec2, poly: list[Vec2]) -> bool:
     yang dibutuhkan visibility graph, yang justru berjalan di antara sudut.
     """
     n = len(poly)
+    t_min = 0.0
+    t_max = 1.0
+    d = b - a
+
     for i in range(n):
-        if segments_cross(a, b, poly[i], poly[(i + 1) % n]):
-            return True
-    mid = Vec2((a.x + b.x) / 2.0, (a.y + b.y) / 2.0)
-    return any(point_in_polygon(p, poly) for p in (a, b, mid))
+        v1 = poly[i]
+        v2 = poly[(i + 1) % n]
+        e = v2 - v1
+        # Normal ke dalam untuk poligon CCW: (-e.y, e.x)
+        nx = -e.y
+        ny = e.x
+        den = nx * d.x + ny * d.y
+        num = nx * (v1.x - a.x) + ny * (v1.y - a.y)
+
+        if den > EPS:
+            t_min = max(t_min, num / den)
+        elif den < -EPS:
+            t_max = min(t_max, num / den)
+        else:
+            if num > EPS:
+                return False
+        if t_min >= t_max - EPS:
+            return False
+
+    t_mid = (t_min + t_max) / 2.0
+    p_mid = Vec2(a.x + t_mid * d.x, a.y + t_mid * d.y)
+    return point_in_polygon(p_mid, poly)

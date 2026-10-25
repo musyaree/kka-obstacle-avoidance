@@ -34,6 +34,12 @@ ROBOT_EDGE = (200, 225, 255)
 GOAL = (255, 90, 220)  # bukan putih, supaya tidak tertukar dengan garis lapangan
 ARROW = (255, 235, 120)
 TEXT = (235, 235, 235)
+ACTIVE_REGION = (255, 245, 120)
+GRAPH = (150, 220, 255)
+PATH = (255, 255, 255)
+TRAJECTORY = (170, 255, 210)
+HORIZON = (255, 220, 80)
+TANGENT = (255, 130, 220)
 
 
 @dataclass
@@ -131,40 +137,94 @@ class SGLineLayer(Layer):
 
 
 class _EmptyLayer(Layer):
-    """Menunggu modul penghasil datanya (planning atau control)."""
+    """Base class untuk lapisan yang datanya mungkin belum tersedia."""
 
     def draw(self, frame: Frame, ctx: RenderContext) -> None:
         return
 
 
 @register_layer("active_region", "4", "Active region")
-class ActiveRegionLayer(_EmptyLayer):
-    pass
+class ActiveRegionLayer(Layer):
+    def draw(self, frame: Frame, ctx: RenderContext) -> None:
+        plan = frame.plan
+        if plan is None or plan.region is None or plan.region.bbox is None:
+            return
+
+        min_x, max_x, min_y, max_y = plan.region.bbox
+        left, top = ctx.view.to_px(Vec2(min_x, max_y))
+        right, bottom = ctx.view.to_px(Vec2(max_x, min_y))
+        rect = pygame.Rect(left, top, right - left, bottom - top)
+        pygame.draw.rect(ctx.surface, ACTIVE_REGION, rect, 2)
+
+        active_ids = set(plan.region.obstacle_ids)
+        for obstacle in frame.scene.obstacles:
+            if obstacle.id not in active_ids:
+                continue
+            points = [ctx.view.to_px(vertex) for vertex in obstacle.vertices()]
+            pygame.draw.polygon(ctx.surface, ACTIVE_REGION, points, 3)
 
 
 @register_layer("visibility_graph", "5", "Visibility graph")
-class VisibilityGraphLayer(_EmptyLayer):
-    pass
+class VisibilityGraphLayer(Layer):
+    def draw(self, frame: Frame, ctx: RenderContext) -> None:
+        if frame.plan is None:
+            return
+        for start, end in frame.plan.edges:
+            pygame.draw.line(ctx.surface, GRAPH, ctx.view.to_px(start), ctx.view.to_px(end), 1)
 
 
 @register_layer("path", "6", "Jalur DAVG", default=True)
-class PathLayer(_EmptyLayer):
-    pass
+class PathLayer(Layer):
+    def draw(self, frame: Frame, ctx: RenderContext) -> None:
+        if frame.plan is None or not frame.plan.path:
+            return
+        points = [ctx.view.to_px(point) for point in frame.plan.path]
+        if len(points) > 1:
+            pygame.draw.lines(ctx.surface, PATH, False, points, 3)
+        for point in points:
+            pygame.draw.circle(ctx.surface, PATH, point, 4)
 
 
 @register_layer("trajectory", "7", "Trajektori")
-class TrajectoryLayer(_EmptyLayer):
-    pass
+class TrajectoryLayer(Layer):
+    def draw(self, frame: Frame, ctx: RenderContext) -> None:
+        if frame.plan is None or not frame.plan.trajectory:
+            return
+        points = [ctx.view.to_px(point.pos) for point in frame.plan.trajectory]
+        if len(points) > 1:
+            pygame.draw.lines(ctx.surface, TRAJECTORY, False, points, 2)
+        for point in points:
+            pygame.draw.circle(ctx.surface, TRAJECTORY, point, 2)
 
 
 @register_layer("horizon", "8", "Horizon MPC")
-class HorizonLayer(_EmptyLayer):
-    pass
+class HorizonLayer(Layer):
+    def draw(self, frame: Frame, ctx: RenderContext) -> None:
+        if frame.track is None or not frame.track.horizon:
+            return
+        points = [ctx.view.to_px(pose.position) for pose in frame.track.horizon]
+        start = ctx.view.to_px(frame.scene.robot.pose.position)
+        points.insert(0, start)
+        if len(points) > 1:
+            pygame.draw.lines(ctx.surface, HORIZON, False, points, 2)
+        for point in points[1:]:
+            pygame.draw.circle(ctx.surface, HORIZON, point, 3)
 
 
 @register_layer("tangent_planes", "9", "Bidang singgung")
-class TangentPlaneLayer(_EmptyLayer):
-    pass
+class TangentPlaneLayer(Layer):
+    def draw(self, frame: Frame, ctx: RenderContext) -> None:
+        if frame.track is None:
+            return
+        for plane in frame.track.tangent_planes:
+            p1 = ctx.view.to_px(plane.p1)
+            p2 = ctx.view.to_px(plane.p2)
+            contact = ctx.view.to_px(plane.point)
+            pygame.draw.line(ctx.surface, TANGENT, p1, p2, 2)
+            pygame.draw.circle(ctx.surface, TANGENT, contact, 3)
+
+            normal_end = plane.point + plane.normal * max(0.25, plane.safe_radius * 0.25)
+            pygame.draw.line(ctx.surface, TANGENT, contact, ctx.view.to_px(normal_end), 1)
 
 
 @register_layer("hud", "0", "HUD", default=True)
