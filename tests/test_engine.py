@@ -119,10 +119,12 @@ def test_kejadian_menghapus_obstacle_dan_membatalkan_pilihan():
     assert frame.selected_id is None
 
 
-def test_enter_belum_mengaktifkan_auto_pada_mvp():
+def test_enter_mengaktifkan_mode_auto():
     frame = make_engine().tick(DT, Intent(toggle_auto=True))
-    assert frame.mode is Mode.MANUAL
-    assert "AUTO" in frame.notice
+    assert frame.mode is Mode.AUTO
+    assert frame.plan is not None
+    assert frame.track is not None
+    assert frame.controller_name != "-"
 
 
 def test_reset_mengembalikan_keadaan_awal():
@@ -143,3 +145,17 @@ def test_frame_adalah_potret_yang_terpisah_dari_engine():
     frame = engine.tick(DT)
     frame.scene.obstacles[0].center = Vec2(0, 0)
     assert engine.scene.obstacles[0].center == Vec2(5, 4)
+
+
+def test_manual_memberi_pratinjau_rencana_tanpa_perintah_pengendali():
+    engine = make_engine(obstacles=[Obstacle(0, Vec2(7.0, 4.5), 1.0)])
+    frame = run(engine, 0.3)
+    assert frame.mode is Mode.MANUAL
+    assert frame.plan is not None and len(frame.plan.path) > 2
+    assert frame.track is None
+
+
+def test_pratinjau_rencana_mengikuti_goal_yang_digeser_di_manual():
+    engine = make_engine()
+    frame = engine.tick(DT, Intent(moves=[Move("goal", Vec2(5.0, 8.0))]))
+    assert frame.plan.path[-1] == Vec2(5.0, 8.0)
