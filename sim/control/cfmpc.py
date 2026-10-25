@@ -2,13 +2,28 @@
 
 Ref: Hou et al., ICRA 2025, arXiv 2504.02184, Bagian 3.
 Lihat docs/cfmpc_algorithm.md untuk detail formulasi QP.
+
+Robot dimodelkan sebagai titik berkecepatan yang dikendalikan lewat percepatan
+(linear, jadi hanya batas tabrakan yang perlu dilinearkan). Tiap obstacle dekat
+memberi satu bidang singgung pada zona amannya di tiap langkah horizon:
+
+    n_k . p_k  >=  n_k . c_k + R - delta_k,    delta_k >= 0
+
+dengan n_k diarahkan dari obstacle ke posisi horizon hasil solve sebelumnya
+(titik acuan bila belum ada), dan c_k posisi obstacle yang diprediksi bergerak
+lurus. Berpatokan pada solusi sebelumnya menjaga robot tetap di sisi obstacle
+yang sama; berpatokan pada acuan membuat arah bidang berbalik-balik begitu
+acuan jatuh di dalam zona obstacle yang bergerak. QP dikompilasi sekali dengan jumlah
+slot obstacle yang tetap, jadi tidak ada kompilasi ulang saat jumlah obstacle
+berubah.
 """
 from __future__ import annotations
 
+import logging
 import math
 import time
-from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+import warnings
+from typing import List, Tuple
 
 import cvxpy as cp
 import numpy as np
@@ -17,21 +32,14 @@ from ..geometry import wrap_angle
 from ..types import Pose, TrackResult, TrajectoryPoint, Vec2, Velocity
 from .follower import Controller, FollowerController, TangentPlane
 
+log = logging.getLogger(__name__)
 
-@dataclass
-class _QPModel:
-    """Model QP terkompilasi dengan cvxpy.Parameter untuk satu jumlah obstacle."""
-    problem: cp.Problem
-    x0: cp.Parameter
-    c0: cp.Parameter
-    s0: cp.Parameter
-    ref: cp.Parameter
-    ref_N: cp.Parameter
-    U: cp.Variable
-    X: cp.Variable
-    Sigma: Optional[cp.Variable] = None
-    normals: Optional[cp.Parameter] = None
-    distances: Optional[cp.Parameter] = None
+SLOTS = 6  # obstacle terdekat yang diberi bidang singgung; sisanya diabaikan
+ANCHOR_MAX_DRIFT = 0.5  # solusi sebelumnya dipakai sebagai patokan bila posisinya masih sedekat ini ke robot (m)
+RELEVANT_MARGIN = 1.0  # bidang hanya dilaporkan bila acuan lebih dekat dari ini ke zona aman (m)
+SLACK_EPS = 1e-4  # slack di bawah ini dianggap nol (galat numerik solver)
+TURN_GAIN = 3.0  # sama dengan FollowerController
+SQRT2 = math.sqrt(2.0)
 
 
 class CfMpcController(Controller):
@@ -39,82 +47,145 @@ class CfMpcController(Controller):
 
     # Bobot QP (mengikuti parameter referensi paper)
     _W_POS: float = 10.0   # bobot posisi pada setiap langkah horizon
-    _W_VEL: float = 1.0    # bobot kontrol (regularisasi u)
-    _W_TERM: float = 50.0  # bobot terminal (posisi akhir -> referensi)
+    _W_VEL: float = 1.0    # bobot kecepatan terhadap kecepatan acuan
+    _W_ACC: float = 0.1    # regularisasi percepatan
+    _W_TERM: float = 40.0  # bobot terminal (posisi akhir -> referensi)
 
     def __init__(self, cfg):
         super().__init__(cfg)
-        self._models: Dict[int, _QPModel] = {}
         self._follower = FollowerController(cfg)
+        self._prev_positions = None  # horizon (2, N+1) hasil solve sebelumnya
+        self._build()
+        self._set_idle_parameters()
+        # kompilasi di muka, bukan saat AUTO pertama atau saat jumlah obstacle berubah
+        self._problem.solve(solver=cp.OSQP, warm_start=True)
 
     @property
     def name(self) -> str:
         return "cf-MPC"
 
-    # ------------------------------------------------------------------
-    # Antarmuka publik
-    # ------------------------------------------------------------------
-
     def reset(self) -> None:
         """Reset state internal pengendali."""
         self._follower.reset()
+        self._prev_positions = None
+
+    # ------------------------------------------------------------------
+    # Masalah QP
+    # ------------------------------------------------------------------
+
+    def _build(self) -> None:
+        cfg = self.cfg
+        n, dt = cfg.horizon, cfg.dt_mpc
+        self.p0, self.v0 = cp.Parameter(2), cp.Parameter(2)
+        self.p_ref, self.v_ref = cp.Parameter((2, n)), cp.Parameter((2, n))
+        self.nx = [cp.Parameter(n) for _ in range(SLOTS)]
+        self.ny = [cp.Parameter(n) for _ in range(SLOTS)]
+        self.rhs = [cp.Parameter(n) for _ in range(SLOTS)]
+
+        P, V, A = cp.Variable((2, n + 1)), cp.Variable((2, n + 1)), cp.Variable((2, n))
+        D = cp.Variable((SLOTS, n), nonneg=True)
+        self._P, self._V, self._A, self._D = P, V, A, D
+
+        constraints = [
+            P[:, 0] == self.p0,
+            V[:, 0] == self.v0,
+            P[:, 1:] == P[:, :-1] + V[:, :-1] * dt + A * (0.5 * dt * dt),
+            V[:, 1:] == V[:, :-1] + A * dt,
+        ]
+        constraints += self._octagon(V[:, 1:], cfg.max_speed)
+        constraints += self._octagon(A, cfg.max_accel)
+        r = cfg.robot_radius
+        constraints += [
+            P[0, 1:] >= r, P[0, 1:] <= cfg.field_width - r,
+            P[1, 1:] >= r, P[1, 1:] <= cfg.field_height - r,
+        ]
+        for j in range(SLOTS):
+            constraints.append(
+                cp.multiply(self.nx[j], P[0, 1:]) + cp.multiply(self.ny[j], P[1, 1:]) >= self.rhs[j] - D[j]
+            )
+
+        cost = (
+            self._W_POS * cp.sum_squares(P[:, 1:-1] - self.p_ref[:, :-1])
+            + self._W_TERM * cp.sum_squares(P[:, -1] - self.p_ref[:, -1])
+            + self._W_VEL * cp.sum_squares(V[:, 1:] - self.v_ref)
+            + self._W_ACC * cp.sum_squares(A)
+            + cfg.rho_slack * cp.sum_squares(D)  # PRD §4.2: rho * sum delta^2
+        )
+        self._problem = cp.Problem(cp.Minimize(cost), constraints)
+        assert self._problem.is_dpp()
+
+    @staticmethod
+    def _octagon(x, limit: float) -> list:
+        """Aproksimasi linear norma <= limit, supaya masalahnya tetap QP."""
+        return [
+            x <= limit, x >= -limit,
+            cp.sum(x, axis=0) <= SQRT2 * limit, cp.sum(x, axis=0) >= -SQRT2 * limit,
+            x[0] - x[1] <= SQRT2 * limit, x[1] - x[0] <= SQRT2 * limit,
+        ]
+
+    def _set_idle_parameters(self) -> None:
+        n = self.cfg.horizon
+        self.p0.value, self.v0.value = np.array([1.0, 1.0]), np.zeros(2)
+        self.p_ref.value, self.v_ref.value = np.ones((2, n)), np.zeros((2, n))
+        self._clear_planes(0)
+
+    def _clear_planes(self, first_free: int) -> None:
+        n = self.cfg.horizon
+        for j in range(first_free, SLOTS):
+            self.nx[j].value = np.zeros(n)
+            self.ny[j].value = np.zeros(n)
+            self.rhs[j].value = -np.ones(n)  # 0 >= -1: selalu terpenuhi
+
+    # ------------------------------------------------------------------
+    # Antarmuka publik
+    # ------------------------------------------------------------------
 
     def track(self, state, trajectory: List[TrajectoryPoint], obstacles) -> TrackResult:
         """Hitung perintah kecepatan optimal menggunakan cf-MPC."""
         t0 = time.perf_counter()
         pose: Pose = state.pose if hasattr(state, "pose") else state
+        n, dt = self.cfg.horizon, self.cfg.dt_mpc
 
         # Tidak ada trajektori -> diam
         if not trajectory:
             return TrackResult(
                 command=Velocity(0.0, 0.0, 0.0),
-                horizon=[pose] * (self.cfg.horizon + 1),
+                horizon=[pose] * (n + 1),
                 tangent_planes=[],
                 slack=0.0,
                 solve_time_ms=(time.perf_counter() - t0) * 1000.0,
             )
 
-        N = self.cfg.horizon
-        dt = self.cfg.dt_mpc
-        rho = self.cfg.rho_slack
+        refs, ref_prev, ref_theta = self._slice_reference(pose, trajectory, n)
+        self._set_state(pose, getattr(state, "velocity", None), refs, ref_prev, dt)
+        anchors = self._anchors(pose, refs)
+        planes = self._fill_planes(pose, anchors, refs, obstacles, n, dt)
 
-        # 1. Kumpulkan trajektori referensi sejauh horizon
-        ref = self._slice_reference(pose, trajectory, N)
-
-        # 2. Bangun bidang singgung dari obstacle aktif
-        tangent_planes = self._build_tangent_planes(pose, obstacles)
-
-        # 3. Formulasikan dan pecahkan QP (dengan kompilasi Parameter)
         try:
-            u_opt, x_pred, slacks = self._solve_qp(
-                pose, ref, tangent_planes, N, dt, rho
-            )
-        except Exception:
-            # Fallback ke pengikut sederhana jika solver mengalami galat tak terduga
+            self._solve()
+        except Exception as exc:  # solver gagal: pengikut sederhana, bukan perintah yang tak dapat dipercaya
+            self._prev_positions = None
+            log.warning("cf-MPC gagal (%s); memakai pengikut sederhana", exc)
             fallback = self._follower.track(state, trajectory, obstacles)
             return TrackResult(
                 command=fallback.command,
                 horizon=fallback.horizon,
-                tangent_planes=tangent_planes,
+                tangent_planes=[tp for tp, _ in planes],
                 slack=0.0,
                 solve_time_ms=(time.perf_counter() - t0) * 1000.0,
             )
 
-        # Simpan nilai slack pada masing-masing bidang singgung
-        for j, tp in enumerate(tangent_planes):
-            if j < len(slacks):
-                tp.slack = float(slacks[j])
-
-        # 4. Kemas hasil
-        command = self._to_velocity(u_opt)
-        horizon = self._to_pose_list(x_pred)
-        total_slack = float(np.sum(slacks))
+        self._prev_positions = np.array(self._P.value)
+        slacks = self._D.value.max(axis=1)
+        for tp, slot in planes:
+            tp.slack = float(slacks[slot]) if slacks[slot] > SLACK_EPS else 0.0
+        slack = float(max((slacks[slot] for _, slot in planes), default=0.0))
 
         return TrackResult(
-            command=command,
-            horizon=horizon,
-            tangent_planes=tangent_planes,
-            slack=total_slack,
+            command=self._command(pose, self._V.value[:, 1], ref_theta[0]),
+            horizon=self._horizon(pose, ref_theta),
+            tangent_planes=[tp for tp, _ in planes],
+            slack=slack if slack > SLACK_EPS else 0.0,
             solve_time_ms=(time.perf_counter() - t0) * 1000.0,
         )
 
@@ -122,196 +193,92 @@ class CfMpcController(Controller):
     # Pembantu privat
     # ------------------------------------------------------------------
 
-    def _slice_reference(self, pose: Pose, trajectory: List[TrajectoryPoint], N: int) -> np.ndarray:
-        """Ambil N titik referensi terdekat. Mengembalikan array (N, 3)."""
+    def _slice_reference(
+        self, pose: Pose, trajectory: List[TrajectoryPoint], n: int
+    ) -> Tuple[List[Vec2], Vec2, List[float]]:
+        """N titik acuan setelah titik terdekat, titik terdekatnya, dan sudut hadap acuan."""
         pos = Vec2(pose.x, pose.y)
         best = min(range(len(trajectory)), key=lambda i: pos.dist(trajectory[i].pos))
-        ref = []
-        for k in range(N):
-            idx = min(best + k + 1, len(trajectory) - 1)
-            tp = trajectory[idx]
-            ref.append([tp.pos.x, tp.pos.y, tp.theta])
-        return np.array(ref, dtype=float)
+        picked = [trajectory[min(best + k + 1, len(trajectory) - 1)] for k in range(n)]
+        return [tp.pos for tp in picked], trajectory[best].pos, [tp.theta for tp in picked]
 
-    def _build_tangent_planes(self, pose: Pose, obstacles) -> List[TangentPlane]:
-        """Buat bidang singgung dari obstacle di sekitar robot."""
-        robot_pos = Vec2(pose.x, pose.y)
-        planes: List[TangentPlane] = []
+    def _set_state(self, pose: Pose, velocity, refs: List[Vec2], ref_prev: Vec2, dt: float) -> None:
+        c, s = math.cos(pose.theta), math.sin(pose.theta)
+        vx, vy = (velocity.vx, velocity.vy) if velocity is not None else (0.0, 0.0)
+        self.p0.value = np.array([pose.x, pose.y])
+        self.v0.value = np.array([c * vx - s * vy, s * vx + c * vy])  # kerangka tubuh -> dunia
+        chain = [ref_prev] + refs
+        self.p_ref.value = np.array([[p.x for p in refs], [p.y for p in refs]])
+        self.v_ref.value = np.array([
+            [(b.x - a.x) / dt for a, b in zip(chain, chain[1:])],
+            [(b.y - a.y) / dt for a, b in zip(chain, chain[1:])],
+        ])
 
-        for obs in obstacles:
-            diff = robot_pos - obs.center
-            dist = diff.norm()
-            safe_r = self.cfg.safe_radius(obs)
+    def _anchors(self, pose: Pose, refs: List[Vec2]) -> List[Vec2]:
+        """Posisi patokan bidang singgung per langkah: solusi sebelumnya bila masih dekat robot, kalau tidak acuan."""
+        prev = self._prev_positions
+        if prev is None or math.hypot(prev[0, 0] - pose.x, prev[1, 0] - pose.y) > ANCHOR_MAX_DRIFT:
+            return refs
+        return [Vec2(float(prev[0, k]), float(prev[1, k])) for k in range(1, len(refs) + 1)]
 
-            if dist < 1e-6:
-                # Robot tepat di pusat obstacle -- normal ke arah x+
-                nx, ny = 1.0, 0.0
-            else:
-                nx, ny = diff.x / dist, diff.y / dist
+    def _fill_planes(self, pose: Pose, anchors: List[Vec2], refs: List[Vec2], obstacles, n: int, dt: float):
+        """Mengisi parameter bidang singgung; mengembalikan [(TangentPlane, slot)] yang relevan untuk lapisan 9."""
+        pos = Vec2(pose.x, pose.y)
+        nearest = sorted(obstacles, key=lambda o: pos.dist(o.center) - self.cfg.safe_radius(o))[:SLOTS]
+        reported = []
+        for j, obs in enumerate(nearest):
+            radius = self.cfg.safe_radius(obs)
+            nx, ny, rhs = np.zeros(n), np.zeros(n), np.zeros(n)
+            best_gap, best_plane = math.inf, None
+            for k in range(1, n + 1):
+                center = obs.center + obs.velocity * (k * dt)  # obstacle diprediksi bergerak lurus
+                away = anchors[k - 1] - center
+                if away.norm() < 1e-6:
+                    away = pos - center
+                if away.norm() < 1e-6:
+                    away = Vec2(1.0, 0.0)
+                normal = away * (1.0 / away.norm())
+                nx[k - 1], ny[k - 1] = normal.x, normal.y
+                rhs[k - 1] = normal.x * center.x + normal.y * center.y + radius
+                gap = (refs[k - 1] - center).norm() - radius
+                if gap < best_gap:
+                    best_gap, best_plane = gap, (center, normal)
+            self.nx[j].value, self.ny[j].value, self.rhs[j].value = nx, ny, rhs
+            if best_gap < RELEVANT_MARGIN and best_plane is not None:
+                center, normal = best_plane
+                contact = center + normal * radius
+                reported.append((TangentPlane(
+                    obstacle_id=obs.id,
+                    point=contact,
+                    normal=normal,
+                    p1=Vec2(contact.x - normal.y, contact.y + normal.x),
+                    p2=Vec2(contact.x + normal.y, contact.y - normal.x),
+                    safe_radius=radius,
+                    slack=0.0,
+                ), j))
+        self._clear_planes(len(nearest))
+        return reported
 
-            # Titik kontak pada permukaan zona aman
-            contact = Vec2(obs.center.x + nx * safe_r, obs.center.y + ny * safe_r)
+    def _solve(self) -> None:
+        with warnings.catch_warnings():
+            # OPTIMAL_INACCURATE diterima di bawah; peringatan cvxpy-nya hanya mengotori keluaran
+            warnings.simplefilter("ignore", UserWarning)
+            self._problem.solve(
+                solver=cp.OSQP, warm_start=True, verbose=False, eps_abs=1e-4, eps_rel=1e-4, max_iter=4000
+            )
+        if self._problem.status not in (cp.OPTIMAL, cp.OPTIMAL_INACCURATE) or self._V.value is None:
+            raise RuntimeError(f"QP tidak terpecahkan: status={self._problem.status}")
 
-            # Dua titik pada garis singgung (tegak lurus normal)
-            p1 = Vec2(contact.x - ny, contact.y + nx)
-            p2 = Vec2(contact.x + ny, contact.y - nx)
+    def _command(self, pose: Pose, v_world: np.ndarray, ref_theta: float) -> Velocity:
+        """Kecepatan dunia pada langkah pertama menjadi perintah kerangka tubuh."""
+        c, s = math.cos(pose.theta), math.sin(pose.theta)
+        wx, wy = float(v_world[0]), float(v_world[1])
+        omega = max(-self.cfg.max_omega, min(self.cfg.max_omega, TURN_GAIN * wrap_angle(ref_theta - pose.theta)))
+        return Velocity(c * wx + s * wy, -s * wx + c * wy, omega)
 
-            planes.append(TangentPlane(
-                obstacle_id=obs.id,
-                point=contact,
-                normal=Vec2(nx, ny),
-                p1=p1,
-                p2=p2,
-                safe_radius=safe_r,
-                slack=0.0,
-            ))
-
-        return planes
-
-    def _get_or_create_model(self, n_obs: int, N: int, dt: float, rho: float) -> _QPModel:
-        """Kompilasi problem CVXPY sekali menggunakan Parameter untuk jumlah obstacle tertentu."""
-        if n_obs in self._models:
-            return self._models[n_obs]
-
-        v_max = self.cfg.max_speed
-        w_max = self.cfg.max_omega
-
-        x0 = cp.Parameter(3)
-        c0 = cp.Parameter()
-        s0 = cp.Parameter()
-        ref = cp.Parameter((N, 2))
-        ref_N = cp.Parameter(2)
-
-        U = cp.Variable((N, 3))
-        X = cp.Variable((N + 1, 3))
-
-        cost = 0.0
-        # Biaya pelacakan trajektori posisi
-        for k in range(N):
-            cost += self._W_POS * cp.sum_squares(X[k + 1, :2] - ref[k, :2])
-        # Biaya terminal
-        cost += self._W_TERM * cp.sum_squares(X[N, :2] - ref_N)
-        # Regularisasi kontrol
-        cost += self._W_VEL * cp.sum_squares(U)
-
-        constraints = [X[0, :] == x0]
-
-        # Dinamika omnidirectional linear
-        for k in range(N):
-            vx_w = c0 * U[k, 0] - s0 * U[k, 1]
-            vy_w = s0 * U[k, 0] + c0 * U[k, 1]
-            constraints += [
-                X[k + 1, 0] == X[k, 0] + dt * vx_w,
-                X[k + 1, 1] == X[k, 1] + dt * vy_w,
-                X[k + 1, 2] == X[k, 2] + dt * U[k, 2],
-                U[k, 0] <= v_max, U[k, 0] >= -v_max,
-                U[k, 1] <= v_max, U[k, 1] >= -v_max,
-                U[k, 2] <= w_max, U[k, 2] >= -w_max,
-            ]
-
-        if n_obs > 0:
-            Sigma = cp.Variable((N, n_obs), nonneg=True)
-            normals = cp.Parameter((n_obs, 2))
-            distances = cp.Parameter(n_obs)
-            # Penalti kuadratik slack (PRD §4.2: rho * sum delta^2)
-            cost += rho * cp.sum_squares(Sigma)
-
-            for j in range(n_obs):
-                for k in range(N):
-                    constraints.append(
-                        normals[j] @ X[k + 1, :2] >= distances[j] - Sigma[k, j]
-                    )
-        else:
-            Sigma = None
-            normals = None
-            distances = None
-
-        prob = cp.Problem(cp.Minimize(cost), constraints)
-        model = _QPModel(
-            problem=prob,
-            x0=x0,
-            c0=c0,
-            s0=s0,
-            ref=ref,
-            ref_N=ref_N,
-            U=U,
-            X=X,
-            Sigma=Sigma,
-            normals=normals,
-            distances=distances,
-        )
-        self._models[n_obs] = model
-        return model
-
-    def _solve_qp(
-        self,
-        pose: Pose,
-        ref: np.ndarray,
-        tangent_planes: List[TangentPlane],
-        N: int,
-        dt: float,
-        rho: float,
-    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """Pecahkan QP menggunakan model Parameter terkompilasi."""
-        n_obs = len(tangent_planes)
-        model = self._get_or_create_model(n_obs, N, dt, rho)
-
-        # Berikan nilai ke parameter
-        model.x0.value = np.array([pose.x, pose.y, pose.theta], dtype=float)
-        model.c0.value = float(math.cos(pose.theta))
-        model.s0.value = float(math.sin(pose.theta))
-        model.ref.value = ref[:, :2]
-        model.ref_N.value = ref[-1, :2]
-
-        if n_obs > 0:
-            norm_arr = np.zeros((n_obs, 2), dtype=float)
-            dist_arr = np.zeros(n_obs, dtype=float)
-            for j, tp in enumerate(tangent_planes):
-                nj = np.array([tp.normal.x, tp.normal.y], dtype=float)
-                cj = np.array([tp.point.x, tp.point.y], dtype=float)
-                norm_arr[j, :] = nj
-                dist_arr[j] = float(nj @ cj)
-            model.normals.value = norm_arr
-            model.distances.value = dist_arr
-
-        # Selesaikan QP menggunakan OSQP
-        model.problem.solve(
-            solver=cp.OSQP,
-            warm_starting=True,
-            verbose=False,
-            eps_abs=1e-4,
-            eps_rel=1e-4,
-            max_iter=4000,
-        )
-
-        status = model.problem.status
-        if status not in (cp.OPTIMAL, cp.OPTIMAL_INACCURATE) or model.U.value is None:
-            raise RuntimeError(f"QP tidak terpecahkan: status={status}")
-
-        u_opt = np.array(model.U.value[0], dtype=float)
-        x_pred = np.array(model.X.value, dtype=float)
-
-        if n_obs > 0 and model.Sigma is not None and model.Sigma.value is not None:
-            slacks = np.array(model.Sigma.value.sum(axis=0), dtype=float)
-        else:
-            slacks = np.zeros(max(1, n_obs), dtype=float)
-
-        return u_opt, x_pred, slacks
-
-    def _to_velocity(self, u: np.ndarray) -> Velocity:
-        """Ubah array kontrol [vx_body, vy_body, omega] menjadi Velocity dengan pemotongan kelajuan."""
-        v_max = self.cfg.max_speed
-        w_max = self.cfg.max_omega
-        vx, vy = float(u[0]), float(u[1])
-        speed = math.hypot(vx, vy)
-        if speed > v_max > 0.0:
-            vx, vy = vx * v_max / speed, vy * v_max / speed
-        omega = float(np.clip(u[2], -w_max, w_max))
-        return Velocity(vx=vx, vy=vy, omega=omega)
-
-    def _to_pose_list(self, x_pred: np.ndarray) -> List[Pose]:
-        """Ubah array prediksi state (N+1, 3) menjadi daftar Pose."""
-        return [
-            Pose(float(row[0]), float(row[1]), float(wrap_angle(row[2])))
-            for row in x_pred
+    def _horizon(self, pose: Pose, ref_theta: List[float]) -> List[Pose]:
+        """Pose saat ini diikuti prediksi N langkah (N + 1 pose)."""
+        return [pose] + [
+            Pose(float(x), float(y), float(theta))
+            for (x, y), theta in zip(self._P.value[:, 1:].T, ref_theta)
         ]

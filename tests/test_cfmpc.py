@@ -1,11 +1,22 @@
 """Unit test untuk pengendali cf-MPC (PRD §4.2, §4.6 kasus 6, §5.1 v2.0)."""
+from __future__ import annotations
+
 import math
 import pytest
 
-from sim.config import Config, load_config, load_scenario
-from sim.control.cfmpc import CfMpcController
+from sim.config import Config, Scenario, load_config, load_scenario
 from sim.engine import Engine
 from sim.types import Intent, Mode, Obstacle, Pose, TrajectoryPoint, Vec2, Velocity
+
+try:
+    import cvxpy  # noqa: F401
+    from sim.control.cfmpc import CfMpcController
+    HAS_CVXPY = True
+except ImportError:
+    HAS_CVXPY = False
+
+# skipif per modul, bukan importorskip: skip saat pengumpulan menghentikan seluruh sesi pytest di sini
+pytestmark = pytest.mark.skipif(not HAS_CVXPY, reason="cvxpy belum terpasang (ekstra mpc)")
 
 
 @pytest.fixture
@@ -109,26 +120,87 @@ def test_cfmpc_kinerja_waktu_solve_cepat(cfmpc: CfMpcController, cfg: Config):
 
 
 def test_cfmpc_integrasi_engine_dan_tombol_c(cfg: Config):
-    """Tombol C mengganti pengendali aktif antara Pengikut sederhana dan cf-MPC."""
+    """cf-MPC adalah pengendali bawaan; tombol C bergantian dengan Pengikut sederhana."""
     scenario = load_scenario("scenarios/default.json", cfg)
     engine = Engine(cfg, scenario)
 
-    # Bawaan adalah follower
-    assert engine.controller.name == "Pengikut sederhana"
-
-    # Tekan C untuk beralih ke cf-MPC
-    f1 = engine.tick(0.05, Intent(switch_controller=True))
+    # Bawaan adalah cf-MPC
     assert engine.controller.name == "cf-MPC"
-    assert "cf-MPC" in f1.notice
 
     # Jalankan mode AUTO dengan cf-MPC
-    f2 = engine.tick(0.05, Intent(toggle_auto=True))
-    assert f2.mode == Mode.AUTO
-    assert f2.controller_name == "cf-MPC"
-    assert f2.track is not None
-    assert f2.track.command is not None
+    f1 = engine.tick(0.05, Intent(toggle_auto=True))
+    assert f1.mode == Mode.AUTO
+    assert f1.controller_name == "cf-MPC"
+    assert f1.track is not None
+    assert f1.track.command is not None
 
-    # Tekan C lagi untuk kembali ke Pengikut sederhana
-    f3 = engine.tick(0.05, Intent(switch_controller=True))
+    # Tekan C untuk beralih ke Pengikut sederhana
+    f2 = engine.tick(0.05, Intent(switch_controller=True))
     assert engine.controller.name == "Pengikut sederhana"
+    assert "Pengikut sederhana" in f2.notice
 
+    # Tekan C lagi untuk kembali ke cf-MPC
+    f3 = engine.tick(0.05, Intent(switch_controller=True))
+    assert engine.controller.name == "cf-MPC"
+    assert "cf-MPC" in f3.notice
+
+
+# --------------------------------------------------------------- slack dan bidang ---
+
+def _straight(cfg: Config, x0: float = 2.0, y: float = 4.5):
+    return [
+        TrajectoryPoint(pos=Vec2(x0 + 0.5 * (k + 1), y), theta=0.0, speed=2.0, t=0.25 * (k + 1))
+        for k in range(cfg.horizon)
+    ]
+
+
+def _auto_engine(cfg: Config, obstacles) -> Engine:
+    engine = Engine(cfg, Scenario("uji", Pose(2.0, 4.5, 0.0), Vec2(12.0, 4.5), list(obstacles), []))
+    engine.tick(0.05, Intent(toggle_auto=True))
+    return engine
+
+
+def test_slack_nol_saat_obstacle_jauh_dari_acuan(cfmpc: CfMpcController, cfg: Config):
+    obs = Obstacle(id=1, center=Vec2(5.0, 8.0), radius=0.5)
+    result = cfmpc.track(Pose(2.0, 4.5, 0.0), _straight(cfg), [obs])
+    assert result.slack == 0.0
+    assert result.tangent_planes == []  # obstacle jauh tidak digambar di lapisan 9
+
+
+def test_bidang_singgung_dilaporkan_untuk_obstacle_dekat_acuan(cfmpc: CfMpcController, cfg: Config):
+    obs = Obstacle(id=7, center=Vec2(4.0, 5.0), radius=0.5)
+    result = cfmpc.track(Pose(2.0, 4.5, 0.0), _straight(cfg), [obs])
+    assert [tp.obstacle_id for tp in result.tangent_planes] == [7]
+
+
+def test_slack_adalah_nilai_terbesar_bukan_jumlah(cfmpc: CfMpcController, cfg: Config):
+    obs = Obstacle(id=1, center=Vec2(5.0, 5.0), radius=0.6)
+    result = cfmpc.track(Pose(5.2, 5.0, 0.0), _straight(cfg, 5.0, 5.0), [obs])
+    # robot terlanjur di dalam zona; pelanggaran tidak mungkin lebih dalam dari radius zona aman
+    assert 0.0 < result.slack <= cfg.safe_radius(obs)
+    assert result.slack == pytest.approx(max(tp.slack for tp in result.tangent_planes))
+
+
+def test_jumlah_obstacle_berubah_tanpa_kompilasi_ulang(cfmpc: CfMpcController, cfg: Config):
+    traj = _straight(cfg)
+    cfmpc.track(Pose(2.0, 4.5, 0.0), traj, [])
+    for n in (1, 3, 7):  # termasuk lebih banyak dari slot yang tersedia
+        obstacles = [Obstacle(id=i, center=Vec2(4.0 + i, 2.0), radius=0.4) for i in range(n)]
+        result = cfmpc.track(Pose(2.0, 4.5, 0.0), traj, obstacles)
+        assert result.solve_time_ms < 25.0, f"n={n}: {result.solve_time_ms} ms"
+
+
+def test_auto_cfmpc_menghindari_obstacle_melintas():
+    # Config() bawaan (2 m/s), bukan config.json: obstacle 1,5 m/s hanya bisa dihindari robot yang cukup cepat
+    cfg = Config()
+    obs = Obstacle(id=1, center=Vec2(7.0, 8.0), radius=0.8, velocity=Vec2(0.0, -1.5))
+    engine = _auto_engine(cfg, [obs])
+    closest = math.inf
+    for _ in range(int(25.0 / 0.05)):
+        frame = engine.tick(0.05)
+        o = frame.scene.obstacles[0]
+        closest = min(closest, frame.scene.robot.pose.position.dist(o.center) - o.radius)
+        if frame.mode is Mode.MANUAL:
+            break
+    assert frame.mode is Mode.MANUAL
+    assert closest >= cfg.robot_radius

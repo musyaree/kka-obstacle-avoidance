@@ -46,7 +46,8 @@ class Engine:
         self.planner = Planner(self.cfg)
         self.follower = FollowerController(self.cfg)
         self.cfmpc = CfMpcController(self.cfg) if CfMpcController is not None else None
-        self.controller: Controller = self.follower
+        # cf-MPC bila cvxpy terpasang; tanpa itu pengikut sederhana (tombol C bergantian bila keduanya ada)
+        self.controller: Controller = self.cfmpc if self.cfmpc is not None else self.follower
         self.last_plan: Optional[PlanResult] = None
         self.last_track: Optional[TrackResult] = None
         self.reset(scenario)
@@ -95,20 +96,12 @@ class Engine:
 
             if self.mode is Mode.MANUAL:
                 self._step_robot(intent.manual, dt)
-                self.last_plan = None
+                # rencana tetap dihitung di MANUAL sebagai pratinjau lapisan 4-7
+                self._refresh_plan(bool(intent.moves) or bool(evt_notice))
                 self.last_track = None
             else:
                 # Mode AUTO: DAVG merencanakan jalur jika sudah waktunya / ada perubahan
-                needs_replan = (
-                    self.last_plan is None
-                    or bool(intent.moves)
-                    or bool(evt_notice)
-                    or self.last_plan.status == PlanStatus.NO_PATH
-                    or self._time_since_plan >= self._replan_period
-                )
-                if needs_replan:
-                    self.last_plan = self.planner.plan(self.scene, self.cfg)
-                    self._time_since_plan = 0.0
+                self._refresh_plan(bool(intent.moves) or bool(evt_notice))
 
                 if self.last_plan.status == PlanStatus.NO_PATH:
                     notice = "Tidak ada jalur"
@@ -124,16 +117,28 @@ class Engine:
                         self.mode = Mode.MANUAL
                         notice = "Sampai di goal"
         else:
-            # Saat paused, jika mode AUTO dan ada perpindahan objek, perbarui plan
-            if self.mode is Mode.AUTO and intent.moves:
-                self.last_plan = self.planner.plan(self.scene, self.cfg)
-                self.last_track = self.controller.track(
-                    self.scene.robot, self.last_plan.trajectory, self.scene.obstacles
-                )
+            # Saat paused, jika ada perpindahan objek, perbarui plan (dan perintah bila AUTO)
+            if intent.moves:
+                self._refresh_plan(True)
+                if self.mode is Mode.AUTO:
+                    self.last_track = self.controller.track(
+                        self.scene.robot, self.last_plan.trajectory, self.scene.obstacles
+                    )
 
         return self._frame(notice)
 
     # --------------------------------------------------------------- internal ---
+
+    def _refresh_plan(self, force: bool) -> None:
+        """Hitung ulang rencana bila belum ada, ada perubahan, tanpa jalur, atau sudah waktunya."""
+        if (
+            self.last_plan is None
+            or force
+            or self.last_plan.status == PlanStatus.NO_PATH
+            or self._time_since_plan >= self._replan_period
+        ):
+            self.last_plan = self.planner.plan(self.scene, self.cfg)
+            self._time_since_plan = 0.0
 
     def _apply_intent(self, intent: Intent) -> str:
         notice = ""
